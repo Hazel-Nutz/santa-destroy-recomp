@@ -1,0 +1,106 @@
+diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
+index a851fab..ef6d971 100644
+--- a/src/audio/xma_context.cpp
++++ b/src/audio/xma_context.cpp
+@@ -20,6 +20,21 @@
+ #include <rex/memory/ring_buffer.h>
+ #include <rex/platform.h>
+ #include <rex/stream.h>
++#include <rex/cvar.h>
++
++#include <array>
++#include <atomic>
++#include <chrono>
++
++REXCVAR_DEFINE_BOOL(xma_diag, false, "Audio",
++                    "BO3 diagnostics: log XMA voices that stop making progress and decoder stats");
++
++namespace {
++// Per-context no-progress streaks; logged once per streak so the log stays small.
++std::array<uint32_t, 512> g_no_progress{};
++std::array<bool, 512> g_reported{};
++std::atomic<uint64_t> g_work_calls{0}, g_progress_calls{0}, g_no_space_calls{0};
++}  // namespace
+ 
+ extern "C" {
+ #if REX_COMPILER_MSVC
+@@ -92,6 +107,46 @@ int XmaContext::Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr) {
+   return 0;
+ }
+ 
++static void XmaDiag(uint32_t id, const char* tag, const XMA_CONTEXT_DATA& init,
++                    const XMA_CONTEXT_DATA& d, int remaining_subframes, int free_blocks) {
++  if (!REXCVAR_GET(xma_diag) || id >= g_no_progress.size()) return;
++  g_work_calls++;
++  const bool progress = d.input_buffer_read_offset != init.input_buffer_read_offset ||
++                        d.output_buffer_write_offset != init.output_buffer_write_offset ||
++                        d.current_buffer != init.current_buffer;
++  if (progress) {
++    g_progress_calls++;
++    g_no_progress[id] = 0;
++    g_reported[id] = false;
++  } else if (++g_no_progress[id] >= 64 && !g_reported[id]) {
++    g_reported[id] = true;
++    REXAPU_WARN(
++        "[xma-diag] ctx {} STUCK ({}) x{}: in0 v{} pk{} in1 v{} pk{} cur{} rd{} | out v{} blk{} r{} w{} "
++        "pad{} sdc{} free{} | stereo{} rate{} loop n{} s{} e{} sub_end{} skip{} | err{}/{} parse{}/{} "
++        "stop_done{} irq_done{} rem_sub{}",
++        id, tag, g_no_progress[id], (uint32_t)d.input_buffer_0_valid,
++        (uint32_t)d.input_buffer_0_packet_count, (uint32_t)d.input_buffer_1_valid,
++        (uint32_t)d.input_buffer_1_packet_count, (uint32_t)d.current_buffer,
++        (uint32_t)d.input_buffer_read_offset, (uint32_t)d.output_buffer_valid,
++        (uint32_t)d.output_buffer_block_count, (uint32_t)d.output_buffer_read_offset,
++        (uint32_t)d.output_buffer_write_offset, (uint32_t)d.output_buffer_padding,
++        (uint32_t)d.subframe_decode_count, free_blocks, (uint32_t)d.is_stereo,
++        (uint32_t)d.sample_rate, (uint32_t)d.loop_count, (uint32_t)d.loop_start,
++        (uint32_t)d.loop_end, (uint32_t)d.loop_subframe_end, (uint32_t)d.loop_subframe_skip,
++        (uint32_t)d.error_status, (uint32_t)d.error_set, (uint32_t)d.parser_error_status,
++        (uint32_t)d.parser_error_set, (uint32_t)d.stop_when_done, (uint32_t)d.interrupt_when_done,
++        remaining_subframes);
++  }
++  using clock = std::chrono::steady_clock;
++  static std::atomic<int64_t> last{0};
++  const int64_t now = clock::now().time_since_epoch().count();
++  int64_t prev = last.load();
++  if (now - prev > 10LL * 1000000000LL && last.compare_exchange_strong(prev, now)) {
++    REXAPU_INFO("[xma-diag] last 10s: Work {} with-progress {} no-space {}", g_work_calls.exchange(0),
++                g_progress_calls.exchange(0), g_no_space_calls.exchange(0));
++  }
++}
++
+ bool XmaContext::Work() {
+   if (!is_allocated() || !is_enabled()) {
+     return false;
+@@ -131,6 +186,9 @@ bool XmaContext::Work() {
+       static_cast<int32_t>(effective_sdc) + data.output_buffer_padding;
+ 
+   if (minimum_subframe_decode_count > remaining_subframe_blocks_in_output_buffer_) {
++    if (REXCVAR_GET(xma_diag)) g_no_space_calls++;
++    XmaDiag(id(), "no-space", initial_data, data, current_frame_remaining_subframes_,
++            remaining_subframe_blocks_in_output_buffer_);
+     StoreContextMerged(data, initial_data, context_ptr);
+     return true;
+   }
+@@ -170,6 +228,9 @@ bool XmaContext::Work() {
+     }
+   }
+ 
++  XmaDiag(id(), "decode", initial_data, data, current_frame_remaining_subframes_,
++          remaining_subframe_blocks_in_output_buffer_);
++
+   // Only invalidate the output when the ring buffer is FULL (no free blocks and read==write).
+   // Invalidating whenever read==write also fired for an empty buffer, i.e. a voice that has
+   // not produced its first frame yet, which the game treats as finished (silent one-shots).
+diff --git a/src/audio/xma_decoder.cpp b/src/audio/xma_decoder.cpp
+index c37d1d1..133228c 100644
+--- a/src/audio/xma_decoder.cpp
++++ b/src/audio/xma_decoder.cpp
+@@ -218,6 +218,8 @@ uint32_t XmaDecoder::AllocateContext() {
+   size_t index = context_bitmap_.Acquire();
+   if (index == -1) {
+     // Out of contexts.
++    static uint32_t warned = 0;
++    if (warned++ < 20) REXAPU_WARN("[xma-diag] XMACreateContext: out of contexts ({} in use)", kContextCount);
+     return 0;
+   }
+ 

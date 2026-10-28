@@ -1,0 +1,893 @@
+diff --git a/include/rex/hook.h b/include/rex/hook.h
+index 4ce4f9b..9649c8a 100644
+--- a/include/rex/hook.h
++++ b/include/rex/hook.h
+@@ -10,6 +10,7 @@
+  */
+ 
+ #pragma once
++#include <cstdlib>
+ 
+ #include <cstring>
+ #include <tuple>
+@@ -39,9 +40,19 @@
+     rex::ppc::HostToGuestFunction<function>(ctx, base);          \
+   }
+ #else
+-#define REX_HOOK(subroutine, function)                  \
+-  extern "C" REX_FUNC(subroutine) {                     \
+-    rex::ppc::HostToGuestFunction<function>(ctx, base); \
++#define REX_HOOK(subroutine, function)                                                    \
++  extern "C" REX_FUNC(subroutine) {                                                       \
++    static const bool ___trace = std::getenv("REX_TRACE_EXPORTS") != nullptr;            \
++    static int ___n = 0;                                                                  \
++    if (___trace && ___n < 40) {                                                          \
++      ++___n;                                                                             \
++      uint32_t a0 = ctx.r3.u32, a1 = ctx.r4.u32, a2 = ctx.r5.u32, a3 = ctx.r6.u32;        \
++      rex::ppc::HostToGuestFunction<function>(ctx, base);                                 \
++      REXKRNL_INFO("[trace] {}({:08X},{:08X},{:08X},{:08X}) -> {:08X}", #subroutine, a0, a1, \
++                   a2, a3, ctx.r3.u32);                                                   \
++      return;                                                                             \
++    }                                                                                     \
++    rex::ppc::HostToGuestFunction<function>(ctx, base);                                   \
+   }
+ #endif
+ 
+diff --git a/include/rex/input/mnk/mnk_input_driver.h b/include/rex/input/mnk/mnk_input_driver.h
+index c8751b7..f754a7f 100644
+--- a/include/rex/input/mnk/mnk_input_driver.h
++++ b/include/rex/input/mnk/mnk_input_driver.h
+@@ -50,6 +50,7 @@ class MnkInputDriver final : public InputDriver,
+   void OnMouseDown(rex::ui::MouseEvent& e) override;
+   void OnMouseUp(rex::ui::MouseEvent& e) override;
+   void OnMouseMove(rex::ui::MouseEvent& e) override;
++  void OnMouseWheel(rex::ui::MouseEvent& e) override;
+ 
+   // WindowListener
+   void OnClosing(rex::ui::UIEvent& e) override;
+@@ -75,6 +76,11 @@ class MnkInputDriver final : public InputDriver,
+ 
+   std::mutex state_mutex_;
+   bool key_down_[256] = {};
++  // Keys pressed since the last state poll / keystroke poll. A tap shorter than
++  // one game frame (or at low frame rates) is still reported as held once.
++  bool latch_state_[256] = {};
++  bool latch_ks_[256] = {};
++  void ApplyLatch(bool (&latch)[256], bool (&saved)[256]);
+ 
+   // Mouse delta tracking. Fractional because relative motion arrives in
+   // fractions of a pixel, and truncating each event drops slow movement.
+@@ -82,6 +88,13 @@ class MnkInputDriver final : public InputDriver,
+   float mouse_dx_ = 0.0f;
+   float mouse_dy_ = 0.0f;
+ 
++  // Wheel notches become short pseudo-key presses lasting a few guest polls.
++  int wheel_up_polls_ = 0;
++  int wheel_down_polls_ = 0;
++  // Smoothed mouse-look output (normalized stick units).
++  double smooth_rx_ = 0.0;
++  double smooth_ry_ = 0.0;
++
+   // UI thread only.
+   int32_t prev_mouse_x_ = 0;
+   int32_t prev_mouse_y_ = 0;
+@@ -101,6 +114,13 @@ class MnkInputDriver final : public InputDriver,
+ 
+   // Keystroke queue
+   std::queue<X_INPUT_KEYSTROKE> keystroke_queue_;
++  // Bound pad inputs (buttons, triggers, stick directions) last reported through
++  // XInputGetKeystroke, plus key repeat state. Menus driven by keystrokes need it.
++  uint64_t ks_last_bits_ = 0;
++  int ks_repeat_idx_ = -1;
++  uint64_t ks_repeat_time_ = 0;
++  bool ks_repeating_ = false;
++  uint64_t KeyBitsLocked();
+ 
+   // Packet number incremented on state change
+   uint32_t packet_number_ = 0;
+diff --git a/src/audio/audio_system.cpp b/src/audio/audio_system.cpp
+index 7a711a8..03d9a38 100644
+--- a/src/audio/audio_system.cpp
++++ b/src/audio/audio_system.cpp
+@@ -92,6 +92,17 @@ X_STATUS AudioSystem::Setup(system::KernelState* kernel_state) {
+ 
+   worker_thread_->set_name("Audio Worker");
+   worker_thread_->Create();
++  // BO3: these host threads run the guest audio callback / XMA decode. At normal priority they
++  // lose CPU to busy game threads on 4-core PCs, the output queue drains and SDL plays silence
++  // (audible dropouts). Run them above everything the game creates: Windows TIME_CRITICAL (15),
++  // the level SDL uses for its own audio thread; the game's threads top out at HIGHEST (2).
++  if (worker_thread_->thread()) {
++#if REX_PLATFORM_WIN32
++    worker_thread_->thread()->set_priority(15);
++#else
++    worker_thread_->thread()->set_priority(rex::thread::ThreadPriority::kHighest);
++#endif
++  }
+ 
+   return X_STATUS_SUCCESS;
+ }
+diff --git a/src/audio/xma_decoder.cpp b/src/audio/xma_decoder.cpp
+index a0a178d..c37d1d1 100644
+--- a/src/audio/xma_decoder.cpp
++++ b/src/audio/xma_decoder.cpp
+@@ -133,6 +133,17 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
+   worker_thread_->set_name("XMA Decoder");
+ 
+   worker_thread_->Create();
++  // BO3: these host threads run the guest audio callback / XMA decode. At normal priority they
++  // lose CPU to busy game threads on 4-core PCs, the output queue drains and SDL plays silence
++  // (audible dropouts). Run them above everything the game creates: Windows TIME_CRITICAL (15),
++  // the level SDL uses for its own audio thread; the game's threads top out at HIGHEST (2).
++  if (worker_thread_->thread()) {
++#if REX_PLATFORM_WIN32
++    worker_thread_->thread()->set_priority(15);
++#else
++    worker_thread_->thread()->set_priority(rex::thread::ThreadPriority::kHighest);
++#endif
++  }
+ 
+   return X_STATUS_SUCCESS;
+ }
+diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
+index 3f9422d..6c70682 100644
+--- a/src/input/mnk/mnk_input_driver.cpp
++++ b/src/input/mnk/mnk_input_driver.cpp
+@@ -10,6 +10,7 @@
+  */
+ #include <rex/input/mnk/mnk_input_driver.h>
+ 
++#include <rex/chrono/clock.h>
+ #include <rex/cvar.h>
+ #include <rex/input/input.h>
+ #include <rex/logging.h>
+@@ -20,7 +21,9 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdlib>
++#include <cstdio>
+ #include <cstring>
++#include <string>
+ #include <string_view>
+ 
+ REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
+@@ -30,6 +33,15 @@ REXCVAR_DEFINE_BOOL(mnk_mouse, false, "Input",
+ REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
+     .range(0.01, 10.0);
+ 
++REXCVAR_DEFINE_BOOL(mnk_invert_y, false, "Input", "Invert mouse Y for the right stick");
++REXCVAR_DEFINE_DOUBLE(mnk_deadzone_comp, 0.18, "Input",
++                      "Mouse look anti-deadzone: stick deflection added as soon as the mouse "
++                      "moves, so small movements clear the game's stick deadzone (0-0.5)");
++REXCVAR_DEFINE_DOUBLE(mnk_curve, 1.0, "Input",
++                      "Mouse look response exponent (1 = linear, <1 = faster small moves)");
++REXCVAR_DEFINE_DOUBLE(mnk_smoothing, 0.0, "Input",
++                      "Mouse look smoothing (0 = off, up to 0.9 = heavy)");
++
+ REXCVAR_DEFINE_STRING(keybind_a, "Semicolon,Space", "Input/Keybinds/Controller", "A button");
+ REXCVAR_DEFINE_STRING(keybind_b, "Quote,Backspace", "Input/Keybinds/Controller", "B button");
+ REXCVAR_DEFINE_STRING(keybind_x, "L", "Input/Keybinds/Controller", "X button");
+@@ -124,7 +136,10 @@ std::string_view TrimSpaces(std::string_view s) {
+ 
+ bool TokenPressed(const bool (&key_down)[256], std::string_view token, uint8_t live_mods) {
+   uint8_t want = TakeModifiers(token);
+-  if (want != live_mods) {
++  // Plain binds fire regardless of held modifiers (so Shift-to-sprint + W works and a
++  // bare modifier like "Shift" or "Control" can be bound). Modifier combos such as
++  // "Shift+Up" require at least those modifiers.
++  if (want != 0 && (live_mods & want) != want) {
+     return false;
+   }
+   rex::ui::VirtualKey vk = rex::ui::ParseVirtualKey(token);
+@@ -254,6 +269,38 @@ X_RESULT MnkInputDriver::GetDeviceCapabilities(DeviceId id, uint32_t flags,
+   return X_ERROR_SUCCESS;
+ }
+ 
++// Test hook: REX_MNK_INJECT=<file>. Each line/word of the file is a key name (as in the keybind
++// cvars); it is pressed for one poll and the file is deleted. Lets headless tests drive menus without
++// relying on window focus. Unset in normal use.
++static const char* InjectPath() {
++  static const char* p = std::getenv("REX_MNK_INJECT");
++  return p;
++}
++
++static void PollInjectFile(bool (&a)[256], bool (&b)[256]) {
++  const char* path = InjectPath();
++  if (!path) return;
++  FILE* f = std::fopen(path, "rb");
++  if (!f) return;
++  char buf[512] = {};
++  size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
++  std::fclose(f);
++  std::remove(path);
++  std::string_view sv(buf, n);
++  size_t i = 0;
++  while (i < sv.size()) {
++    while (i < sv.size() && (sv[i] == ' ' || sv[i] == '\n' || sv[i] == '\r' || sv[i] == ',')) ++i;
++    size_t j = i;
++    while (j < sv.size() && !(sv[j] == ' ' || sv[j] == '\n' || sv[j] == '\r' || sv[j] == ',')) ++j;
++    if (j > i) {
++      auto vk = static_cast<uint16_t>(rex::ui::ParseVirtualKey(sv.substr(i, j - i)));
++      if (vk && vk < 256) a[vk] = b[vk] = true;
++      REXLOG_INFO("[mnk] inject {} -> vk {:02X}", sv.substr(i, j - i), vk);
++    }
++    i = j;
++  }
++}
++
+ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
+   if (!IsEnabled() || id != kMnkDevice) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+@@ -264,6 +311,12 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
+   QueueMouseCaptureUpdate(IsEnabled() && REXCVAR_GET(mnk_mouse) && IsMouseLookActive() &&
+                           has_focus_ && is_active());
+ 
++  {
++    std::lock_guard lock(state_mutex_);
++    PollInjectFile(latch_state_, latch_ks_);
++  }
++  if (InjectPath()) has_focus_ = true;
++
+   if (!is_active() || !has_focus_) {
+     if (out_state) {
+       std::memset(out_state, 0, sizeof(*out_state));
+@@ -274,6 +327,17 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
+ 
+   std::lock_guard lock(state_mutex_);
+ 
++  key_down_[0x0A] = wheel_up_polls_ > 0;
++  key_down_[0x0B] = wheel_down_polls_ > 0;
++  bool saved_keys[256];
++  ApplyLatch(latch_state_, saved_keys);
++  struct Restore {
++    bool (&dst)[256]; bool (&src)[256];
++    ~Restore() { std::memcpy(dst, src, sizeof(dst)); }
++  } restore_keys{key_down_, saved_keys};
++  if (wheel_up_polls_ > 0) --wheel_up_polls_;
++  if (wheel_down_polls_ > 0) --wheel_down_polls_;
++
+   uint16_t buttons = 0;
+   if (IsBindPressed(key_down_, REXCVAR_GET(keybind_a)))
+     buttons |= X_INPUT_GAMEPAD_A;
+@@ -332,10 +396,31 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
+     ry -= INT16_MAX;
+ 
+   if (REXCVAR_GET(mnk_mouse) && IsMouseLookActive()) {
++    // Mouse delta -> stick deflection. Console games apply a radial deadzone and
++    // an acceleration curve to the stick, so raw deltas feel dead for small moves;
++    // an anti-deadzone offset and optional curve/smoothing compensate.
+     double sensitivity = REXCVAR_GET(mnk_sensitivity);
+-    constexpr double kBaseScale = 200.0;
+-    rx += static_cast<int32_t>(double(mouse_dx_) * sensitivity * kBaseScale);
+-    ry += static_cast<int32_t>(double(-mouse_dy_) * sensitivity * kBaseScale);
++    constexpr double kBaseScale = 200.0 / 32767.0;  // normalized units per pixel
++    double vx = double(mouse_dx_) * sensitivity * kBaseScale;
++    double vy = double(-mouse_dy_) * sensitivity * kBaseScale;
++    if (REXCVAR_GET(mnk_invert_y)) vy = -vy;
++    double mag = std::sqrt(vx * vx + vy * vy);
++    double ox = 0.0, oy = 0.0;
++    if (mag > 1e-6) {
++      double dz = std::clamp(REXCVAR_GET(mnk_deadzone_comp), 0.0, 0.5);
++      double curve = std::clamp(REXCVAR_GET(mnk_curve), 0.2, 3.0);
++      double m = std::pow(std::min(mag, 1.0), curve);
++      double out = dz + (1.0 - dz) * m;
++      ox = vx / mag * out;
++      oy = vy / mag * out;
++    }
++    double a = std::clamp(REXCVAR_GET(mnk_smoothing), 0.0, 0.9);
++    smooth_rx_ = smooth_rx_ * a + ox * (1.0 - a);
++    smooth_ry_ = smooth_ry_ * a + oy * (1.0 - a);
++    if (std::abs(smooth_rx_) < 1e-3) smooth_rx_ = 0.0;
++    if (std::abs(smooth_ry_) < 1e-3) smooth_ry_ = 0.0;
++    rx += static_cast<int32_t>(smooth_rx_ * 32767.0);
++    ry += static_cast<int32_t>(smooth_ry_ * 32767.0);
+   }
+   // Drained unconditionally: deltas keep accumulating in OnMouseMove while the
+   // mouse is off, and toggling it on would otherwise dump the whole backlog
+@@ -348,6 +433,17 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
+   };
+ 
+   packet_number_++;
++  {
++    static const bool dbg = std::getenv("REX_MNK_DEBUG") != nullptr;
++    static uint16_t last_buttons = 0xFFFF;
++    static uint32_t polls = 0;
++    ++polls;
++    if (dbg && (buttons != last_buttons || (polls % 600) == 1)) {
++      REXLOG_INFO("[mnk] poll#{} buttons={:04X} lt={} rt={} lx={} ly={} focus={} active={}", polls, buttons,
++                  lt, rt, lx, ly, bool(has_focus_), is_active());
++      last_buttons = buttons;
++    }
++  }
+ 
+   if (out_state) {
+     out_state->packet_number = packet_number_;
+@@ -369,20 +465,130 @@ X_RESULT MnkInputDriver::SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibr
+   return X_ERROR_SUCCESS;
+ }
+ 
++// Bit layout matches SDLInputDriver: 0-15 XInput button bits, 16/17 LT/RT,
++// 18-25 left stick dirs (U,D,R,L,UL,UR,DR,DL), 26-33 right stick dirs.
++static constexpr uint16_t kMnkVk[34] = {
++    0x5810, 0x5811, 0x5812, 0x5813, 0x5814, 0x5815, 0x5816, 0x5817,
++    0x5805, 0x5804, 0,      0,      0x5800, 0x5801, 0x5802, 0x5803,
++    0x5806, 0x5807,
++    0x5820, 0x5821, 0x5822, 0x5823, 0x5824, 0x5825, 0x5826, 0x5827,
++    0x5830, 0x5831, 0x5832, 0x5833, 0x5834, 0x5835, 0x5836, 0x5837,
++};
++
++static uint64_t StickBits(bool u, bool d, bool l, bool r) {
++  if (u && d) u = d = false;
++  if (l && r) l = r = false;
++  if (u && l) return 1u << 4;
++  if (u && r) return 1u << 5;
++  if (d && r) return 1u << 6;
++  if (d && l) return 1u << 7;
++  if (u) return 1u << 0;
++  if (d) return 1u << 1;
++  if (r) return 1u << 2;
++  if (l) return 1u << 3;
++  return 0;
++}
++
++uint64_t MnkInputDriver::KeyBitsLocked() {
++  auto p = [&](const std::string& v) { return IsBindPressed(key_down_, v); };
++  uint64_t b = 0;
++  if (p(REXCVAR_GET(keybind_dpad_up))) b |= X_INPUT_GAMEPAD_DPAD_UP;
++  if (p(REXCVAR_GET(keybind_dpad_down))) b |= X_INPUT_GAMEPAD_DPAD_DOWN;
++  if (p(REXCVAR_GET(keybind_dpad_left))) b |= X_INPUT_GAMEPAD_DPAD_LEFT;
++  if (p(REXCVAR_GET(keybind_dpad_right))) b |= X_INPUT_GAMEPAD_DPAD_RIGHT;
++  if (p(REXCVAR_GET(keybind_start))) b |= X_INPUT_GAMEPAD_START;
++  if (p(REXCVAR_GET(keybind_back))) b |= X_INPUT_GAMEPAD_BACK;
++  if (p(REXCVAR_GET(keybind_lstick_press))) b |= X_INPUT_GAMEPAD_LEFT_THUMB;
++  if (p(REXCVAR_GET(keybind_rstick_press))) b |= X_INPUT_GAMEPAD_RIGHT_THUMB;
++  if (p(REXCVAR_GET(keybind_left_shoulder))) b |= X_INPUT_GAMEPAD_LEFT_SHOULDER;
++  if (p(REXCVAR_GET(keybind_right_shoulder))) b |= X_INPUT_GAMEPAD_RIGHT_SHOULDER;
++  if (p(REXCVAR_GET(keybind_a))) b |= X_INPUT_GAMEPAD_A;
++  if (p(REXCVAR_GET(keybind_b))) b |= X_INPUT_GAMEPAD_B;
++  if (p(REXCVAR_GET(keybind_x))) b |= X_INPUT_GAMEPAD_X;
++  if (p(REXCVAR_GET(keybind_y))) b |= X_INPUT_GAMEPAD_Y;
++  if (p(REXCVAR_GET(keybind_left_trigger))) b |= uint64_t(1) << 16;
++  if (p(REXCVAR_GET(keybind_right_trigger))) b |= uint64_t(1) << 17;
++  b |= StickBits(p(REXCVAR_GET(keybind_lstick_up)), p(REXCVAR_GET(keybind_lstick_down)),
++                 p(REXCVAR_GET(keybind_lstick_left)), p(REXCVAR_GET(keybind_lstick_right)))
++       << 18;
++  b |= StickBits(p(REXCVAR_GET(keybind_rstick_up)), p(REXCVAR_GET(keybind_rstick_down)),
++                 p(REXCVAR_GET(keybind_rstick_left)), p(REXCVAR_GET(keybind_rstick_right)))
++       << 26;
++  return b;
++}
++
+ X_RESULT MnkInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
+                                             X_INPUT_KEYSTROKE* out_keystroke) {
+   if (!IsEnabled() || id != kMnkDevice) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
++  if (!out_keystroke) {
++    return X_ERROR_BAD_ARGUMENTS;
++  }
+   std::lock_guard lock(state_mutex_);
+-  if (keystroke_queue_.empty()) {
++  if (!keystroke_queue_.empty()) {
++    *out_keystroke = keystroke_queue_.front();
++    keystroke_queue_.pop();
++    return X_ERROR_SUCCESS;
++  }
++
++  // Wheel pseudo-keys are consumed by state polls; reflect them here too so a
++  // keystroke-only menu still sees a wheel notch.
++  key_down_[0x0A] = wheel_up_polls_ > 0;
++  key_down_[0x0B] = wheel_down_polls_ > 0;
++  bool saved_keys[256];
++  ApplyLatch(latch_ks_, saved_keys);
++  const uint64_t cur = (is_active() && has_focus_) ? KeyBitsLocked() : 0;
++  std::memcpy(key_down_, saved_keys, sizeof(key_down_));
++
++  out_keystroke->unicode = 0;
++  out_keystroke->user_index = 0;
++  out_keystroke->hid_code = 0;
++
++  // Same repeat timing as the SDL driver (400 ms delay, 100 ms rate).
++  const uint64_t now = rex::chrono::Clock::QueryGuestUptimeMillis();
++  if (ks_repeat_idx_ >= 0 && (cur & (uint64_t(1) << ks_repeat_idx_))) {
++    uint64_t wait = ks_repeating_ ? 100 : 400;
++    if (now - ks_repeat_time_ > wait && cur == ks_last_bits_) {
++      ks_repeating_ = true;
++      ks_repeat_time_ = now;
++      out_keystroke->virtual_key = kMnkVk[ks_repeat_idx_];
++      out_keystroke->flags = X_INPUT_KEYSTROKE_KEYDOWN | X_INPUT_KEYSTROKE_REPEAT;
++      return X_ERROR_SUCCESS;
++    }
++  }
++
++  const uint64_t changed = cur ^ ks_last_bits_;
++  if (!changed) {
+     return X_ERROR_EMPTY;
+   }
+-  if (out_keystroke) {
+-    *out_keystroke = keystroke_queue_.front();
++  // Releases first, then presses (XInput order for stick diagonals).
++  for (int pass = 0; pass < 2; ++pass) {
++    for (int i = 0; i < 34; ++i) {
++      uint64_t bit = uint64_t(1) << i;
++      if (!(changed & bit) || !kMnkVk[i]) continue;
++      bool down = cur & bit;
++      if (pass == 0 && !down) {
++        ks_last_bits_ &= ~bit;
++        if (ks_repeat_idx_ == i) ks_repeat_idx_ = -1;
++        out_keystroke->virtual_key = kMnkVk[i];
++        out_keystroke->flags = X_INPUT_KEYSTROKE_KEYUP;
++        return X_ERROR_SUCCESS;
++      }
++      if (pass == 1 && down) {
++        ks_last_bits_ |= bit;
++        ks_repeat_idx_ = i;
++        ks_repeating_ = false;
++        ks_repeat_time_ = now;
++        out_keystroke->virtual_key = kMnkVk[i];
++        out_keystroke->flags = X_INPUT_KEYSTROKE_KEYDOWN;
++        if (std::getenv("REX_MNK_DEBUG")) REXLOG_INFO("[mnk] keystroke down {:04X}", kMnkVk[i]);
++        return X_ERROR_SUCCESS;
++      }
++    }
+   }
+-  keystroke_queue_.pop();
+-  return X_ERROR_SUCCESS;
++  ks_last_bits_ = cur;  // only unmapped bits differed
++  return X_ERROR_EMPTY;
+ }
+ 
+ void MnkInputDriver::EnqueueKeystroke(uint16_t vk_pad, bool down) {
+@@ -477,10 +683,23 @@ void MnkInputDriver::RecenterCursorFromUIThread(int32_t x, int32_t y) {
+ void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
+   if (vk < 256) {
+     key_down_[vk] = down;
++    if (down) {
++      latch_state_[vk] = true;
++      latch_ks_[vk] = true;
++    }
++  }
++}
++
++void MnkInputDriver::ApplyLatch(bool (&latch)[256], bool (&saved)[256]) {
++  std::memcpy(saved, key_down_, sizeof(saved));
++  for (int i = 0; i < 256; ++i) {
++    if (latch[i]) key_down_[i] = true;
++    latch[i] = false;
+   }
+ }
+ 
+ void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
++  if (std::getenv("REX_MNK_DEBUG")) REXLOG_INFO("[mnk] keydown vk={:02X} enabled={} focus={}", uint16_t(e.virtual_key()), IsEnabled(), bool(has_focus_));
+   if (!IsEnabled() || !has_focus_)
+     return;
+   std::lock_guard lock(state_mutex_);
+@@ -510,6 +729,12 @@ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
+     case rex::ui::MouseEvent::Button::kMiddle:
+       SetKeyState(static_cast<uint16_t>(VirtualKey::kMButton), true);
+       break;
++    case rex::ui::MouseEvent::Button::kX1:
++      SetKeyState(static_cast<uint16_t>(VirtualKey::kXButton1), true);
++      break;
++    case rex::ui::MouseEvent::Button::kX2:
++      SetKeyState(static_cast<uint16_t>(VirtualKey::kXButton2), true);
++      break;
+     default:
+       break;
+   }
+@@ -529,6 +754,12 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
+     case rex::ui::MouseEvent::Button::kMiddle:
+       SetKeyState(static_cast<uint16_t>(VirtualKey::kMButton), false);
+       break;
++    case rex::ui::MouseEvent::Button::kX1:
++      SetKeyState(static_cast<uint16_t>(VirtualKey::kXButton1), false);
++      break;
++    case rex::ui::MouseEvent::Button::kX2:
++      SetKeyState(static_cast<uint16_t>(VirtualKey::kXButton2), false);
++      break;
+     default:
+       break;
+   }
+@@ -558,6 +789,15 @@ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
+   }
+ }
+ 
++void MnkInputDriver::OnMouseWheel(rex::ui::MouseEvent& e) {
++  if (!IsEnabled() || !has_focus_)
++    return;
++  std::lock_guard lock(state_mutex_);
++  // Hold each notch for 3 guest polls (~50 ms at 60 Hz) so the game sees it.
++  if (e.scroll_y() > 0) wheel_up_polls_ = 3;
++  if (e.scroll_y() < 0) wheel_down_polls_ = 3;
++}
++
+ void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
+   has_focus_ = false;
+   // Withdraw the request too, or an update queued before the focus loss grabs
+@@ -566,6 +806,8 @@ void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
+   {
+     std::lock_guard lock(state_mutex_);
+     std::memset(key_down_, 0, sizeof(key_down_));
++    std::memset(latch_state_, 0, sizeof(latch_state_));
++    std::memset(latch_ks_, 0, sizeof(latch_ks_));
+     mouse_dx_ = 0.0f;
+     mouse_dy_ = 0.0f;
+   }
+diff --git a/src/kernel/xam/apps/xgi_app.cpp b/src/kernel/xam/apps/xgi_app.cpp
+index 2b222da..e07e541 100644
+--- a/src/kernel/xam/apps/xgi_app.cpp
++++ b/src/kernel/xam/apps/xgi_app.cpp
+@@ -140,6 +140,14 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+                     user_count, xuid_array_ptr, user_index_array, private_slots_array);
+       return X_E_SUCCESS;
+     }
++    case 0x000B0013: {
++      // XSessionLeaveLocal / XSessionLeaveRemote (same layout as join). BO3 leaves its
++      // local zombies session on every return to the menu; failing it left the session stuck.
++      uint32_t session_ptr = buffer_length >= 4 ? memory::load_and_swap<uint32_t>(buffer + 0) : 0;
++      uint32_t user_count = buffer_length >= 8 ? memory::load_and_swap<uint32_t>(buffer + 4) : 0;
++      REXKRNL_DEBUG("XGISessionLeave({:08X}, {})", session_ptr, user_count);
++      return X_E_SUCCESS;
++    }
+     case 0x000B0014: {
+       assert_true(!buffer_length || buffer_length == 16);
+ 
+diff --git a/src/kernel/xam/xam_info.cpp b/src/kernel/xam/xam_info.cpp
+index 1fda053..cb9cfd3 100644
+--- a/src/kernel/xam/xam_info.cpp
++++ b/src/kernel/xam/xam_info.cpp
+@@ -329,6 +329,15 @@ u32 XamSwapDisc_entry(u32 disc_number) {
+   return X_STATUS_SUCCESS;
+ }
+ 
++
++// BO3: the D3D layer sizes its front/back buffers from this; the stub left them 0x0.
++void XGetDisplaySize_entry(mapped_u32 width_ptr, mapped_u32 height_ptr) {
++  if (width_ptr) *width_ptr = 1280;
++  if (height_ptr) *height_ptr = 720;
++}
++
++u32 XamGetLanguage_entry() { return XGetLanguage_entry(); }
++
+ }  // namespace xam
+ }  // namespace kernel
+ }  // namespace rex
+@@ -363,3 +372,5 @@ REX_EXPORT(__imp__XamFree, rex::kernel::xam::XamFree_entry)
+ REX_EXPORT(__imp__XamQueryLiveHiveW, rex::kernel::xam::XamQueryLiveHiveW_entry)
+ REX_EXPORT(__imp__XamLoaderGetDvdTrayState, rex::kernel::xam::XamLoaderGetDvdTrayState_entry)
+ REX_EXPORT(__imp__XamSwapDisc, rex::kernel::xam::XamSwapDisc_entry)
++REX_EXPORT(__imp__XGetDisplaySize, rex::kernel::xam::XGetDisplaySize_entry)
++REX_EXPORT(__imp__XamGetLanguage, rex::kernel::xam::XamGetLanguage_entry)
+diff --git a/src/kernel/xam/xam_locale.cpp b/src/kernel/xam/xam_locale.cpp
+index 4496ac3..ab95a57 100644
+--- a/src/kernel/xam/xam_locale.cpp
++++ b/src/kernel/xam/xam_locale.cpp
+@@ -418,7 +418,6 @@ REX_EXPORT_STUB(__imp__XamFormatMessage);
+ REX_EXPORT_STUB(__imp__XamFormatSystemDateString);
+ REX_EXPORT_STUB(__imp__XamGetCountry);
+ REX_EXPORT_STUB(__imp__XamGetCurrencyFormat);
+-REX_EXPORT_STUB(__imp__XamGetLanguage);
+ REX_EXPORT_STUB(__imp__XamGetLanguageLocaleFallbackString);
+ REX_EXPORT_STUB(__imp__XamGetLanguageTypeface);
+ REX_EXPORT_STUB(__imp__XamGetLanguageTypefacePatch);
+diff --git a/src/kernel/xam/xam_misc.cpp b/src/kernel/xam/xam_misc.cpp
+index ff6cb56..fe1270d 100644
+--- a/src/kernel/xam/xam_misc.cpp
++++ b/src/kernel/xam/xam_misc.cpp
+@@ -220,7 +220,6 @@ REX_EXPORT_STUB(__imp__XGOffsetResourceAddress);
+ REX_EXPORT_STUB(__imp__XGSetTextureHeader);
+ REX_EXPORT_STUB(__imp__XGSetTextureHeaderEx);
+ REX_EXPORT_STUB(__imp__XGetAudioFlags);
+-REX_EXPORT_STUB(__imp__XGetDisplaySize);
+ REX_EXPORT_STUB(__imp__XGetOverlappedExtendedError);
+ REX_EXPORT_STUB(__imp__XGetOverlappedResult);
+ REX_EXPORT_STUB(__imp__XGetSSLCertBypassEnabled);
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_memory.cpp b/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
+index 8684eda..e5b2b89 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
+@@ -92,15 +92,15 @@ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_si
+ 
+   // Must request a size.
+   if (!base_addr_ptr || !region_size_ptr || !*region_size_ptr) {
+-    return X_STATUS_INVALID_PARAMETER;
++    { REXKRNL_WARN("NtAllocateVirtualMemory -> X_STATUS_INVALID_PARAMETER (line 95)"); return X_STATUS_INVALID_PARAMETER; }
+   }
+   // Check allocation type.
+   if (!(alloc_type & (X_MEM_COMMIT | X_MEM_RESET | X_MEM_RESERVE))) {
+-    return X_STATUS_INVALID_PARAMETER;
++    { REXKRNL_WARN("NtAllocateVirtualMemory -> X_STATUS_INVALID_PARAMETER (line 99)"); return X_STATUS_INVALID_PARAMETER; }
+   }
+   // If MEM_RESET is set only MEM_RESET can be set.
+   if (alloc_type & X_MEM_RESET && (alloc_type & ~X_MEM_RESET)) {
+-    return X_STATUS_INVALID_PARAMETER;
++    { REXKRNL_WARN("NtAllocateVirtualMemory -> X_STATUS_INVALID_PARAMETER (line 103)"); return X_STATUS_INVALID_PARAMETER; }
+   }
+   // Don't allow games to set execute bits.
+   if (protect_bits & (X_PAGE_EXECUTE | X_PAGE_EXECUTE_READ | X_PAGE_EXECUTE_READWRITE |
+@@ -113,7 +113,7 @@ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_si
+     // ignore specified page size when base address is specified.
+     auto heap = REX_KERNEL_MEMORY()->LookupHeap(*base_addr_ptr);
+     if (!heap || heap->heap_type() != memory::HeapType::kGuestVirtual) {
+-      return X_STATUS_INVALID_PARAMETER;
++      { REXKRNL_WARN("NtAllocateVirtualMemory -> X_STATUS_INVALID_PARAMETER (line 116)"); return X_STATUS_INVALID_PARAMETER; }
+     }
+     page_size = heap->page_size();
+   } else {
+@@ -154,11 +154,11 @@ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_si
+   if (adjusted_base != 0) {
+     heap = REX_KERNEL_MEMORY()->LookupHeap(adjusted_base);
+     if (!heap) {
+-      return X_STATUS_INVALID_PARAMETER;
++      { REXKRNL_WARN("NtAllocateVirtualMemory -> X_STATUS_INVALID_PARAMETER (line 157)"); return X_STATUS_INVALID_PARAMETER; }
+     }
+     if (heap->page_size() != page_size) {
+       // Specified the wrong page size for the wrong heap.
+-      return X_STATUS_ACCESS_DENIED;
++      { REXKRNL_WARN("NtAllocateVirtualMemory -> X_STATUS_ACCESS_DENIED (line 161)"); return X_STATUS_ACCESS_DENIED; }
+     }
+     was_commited = heap->QueryRegionInfo(adjusted_base, &prev_alloc_info) &&
+                    (prev_alloc_info.state & memory::kMemoryAllocationCommit) != 0;
+@@ -173,7 +173,7 @@ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_si
+   }
+   if (!address) {
+     // Failed - assume no memory available.
+-    return X_STATUS_NO_MEMORY;
++    { REXKRNL_WARN("NtAllocateVirtualMemory -> X_STATUS_NO_MEMORY (line 176)"); return X_STATUS_NO_MEMORY; }
+   }
+ 
+   // Zero memory, if needed.
+@@ -400,6 +400,9 @@ u32 MmAllocatePhysicalMemoryEx_entry(u32 flags, u32 region_size, u32 protect_bit
+   if (!heap->AllocRange(heap_min_addr, heap_max_addr, adjusted_size, adjusted_alignment,
+                         allocation_type, protect, top_down, &base_address)) {
+     // Failed - assume no memory available.
++    REXKRNL_WARN("MmAllocatePhysicalMemoryEx FAILED: size={:#x} page={:#x} protect={:#x} min={:#x} max={:#x} align={:#x}",
++                 (uint32_t)region_size, page_size, (uint32_t)protect_bits, (uint32_t)min_addr_range,
++                 (uint32_t)max_addr_range, (uint32_t)alignment);
+     return 0;
+   }
+   REXKRNL_IMPORT_RESULT("MmAllocatePhysicalMemoryEx", "addr={:#x}", base_address);
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 76cc877..4853bee 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <cstdlib>
+ #include <algorithm>
+ #include <cstring>
+ #include <utility>
+@@ -547,6 +548,10 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
+         "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
+         is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
+         rex::thread::current_thread_id());
++    // Debug aid: abort on the first unhandled guest AV so a debugger captures the
++    // faulting recompiled frame (default behaviour retries the faulting access forever).
++    static const bool abort_on_av = std::getenv("REX_ABORT_ON_UNHANDLED_AV") != nullptr;
++    if (abort_on_av) std::abort();
+     return false;
+   }
+ 
+diff --git a/src/system/xsocket.cpp b/src/system/xsocket.cpp
+index 2d13ac8..b6c2acf 100644
+--- a/src/system/xsocket.cpp
++++ b/src/system/xsocket.cpp
+@@ -29,6 +29,8 @@
+ #include <netinet/in.h>
+ #include <netinet/ip.h>
+ #include <sys/socket.h>
++#include <sys/ioctl.h>
++#include <netinet/tcp.h>
+ #endif
+ 
+ namespace rex::system {
+@@ -76,9 +78,62 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
+     return X_STATUS_SUCCESS;
+   }
+ 
+-  int ret = setsockopt(native_handle_, level, optname, (char*)optval_ptr, optlen);
++  // Translate Xbox (WinSock-numbered, big-endian valued) options to the host.
++  int native_level = -1, native_opt = -1;
++  if (level == 0xFFFF) {  // SOL_SOCKET
++    native_level = SOL_SOCKET;
++    switch (optname) {
++      case 0x0001: native_opt = SO_DEBUG; break;
++      case 0x0004: native_opt = SO_REUSEADDR; break;
++      case 0x0008: native_opt = SO_KEEPALIVE; break;
++      case 0x0010: native_opt = SO_DONTROUTE; break;
++      case 0x0020: native_opt = SO_BROADCAST; break;
++      case 0x0080: native_opt = SO_LINGER; break;
++      case 0x1001: native_opt = SO_SNDBUF; break;
++      case 0x1002: native_opt = SO_RCVBUF; break;
++      case 0x1005: native_opt = SO_SNDTIMEO; break;
++      case 0x1006: native_opt = SO_RCVTIMEO; break;
++      default: break;
++    }
++  } else if (level == 6 && optname == 0x0001) {  // IPPROTO_TCP / TCP_NODELAY
++    native_level = IPPROTO_TCP;
++    native_opt = TCP_NODELAY;
++  }
++  if (native_level < 0 || native_opt < 0) {
++    // Unknown/unsupported option (e.g. SO_EXCLUSIVEADDRUSE): accept so titles don't abort.
++    return X_STATUS_SUCCESS;
++  }
++  int ret;
++  if (native_opt == SO_LINGER && optlen >= 4) {
++    uint16_t be[2];
++    std::memcpy(be, optval_ptr, 4);
++    struct linger l;
++    l.l_onoff = __builtin_bswap16(be[0]);
++    l.l_linger = __builtin_bswap16(be[1]);
++    ret = setsockopt(native_handle_, native_level, native_opt, (char*)&l, sizeof(l));
++  } else if ((native_opt == SO_SNDTIMEO || native_opt == SO_RCVTIMEO) && optlen >= 4) {
++    uint32_t be;
++    std::memcpy(&be, optval_ptr, 4);
++    uint32_t ms = __builtin_bswap32(be);
++#if REX_PLATFORM_WIN32
++    DWORD tv = ms;
++#else
++    struct timeval tv;
++    tv.tv_sec = ms / 1000;
++    tv.tv_usec = (ms % 1000) * 1000;
++#endif
++    ret = setsockopt(native_handle_, native_level, native_opt, (char*)&tv, sizeof(tv));
++  } else if (optlen >= 4) {
++    uint32_t be;
++    std::memcpy(&be, optval_ptr, 4);
++    int value = static_cast<int>(__builtin_bswap32(be));
++    ret = setsockopt(native_handle_, native_level, native_opt, (char*)&value, sizeof(value));
++  } else {
++    // 1-byte boolean options
++    int value = optlen ? *reinterpret_cast<uint8_t*>(optval_ptr) : 0;
++    ret = setsockopt(native_handle_, native_level, native_opt, (char*)&value, sizeof(value));
++  }
+   if (ret < 0) {
+-    // TODO: WSAGetLastError()
+     return X_STATUS_UNSUCCESSFUL;
+   }
+ 
+@@ -91,6 +146,28 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
+ }
+ 
+ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
++  // Guest passes Xbox/WinSock command codes with a big-endian u_long argument.
++  // Translate the common ones so behaviour is correct on every host (BO3 needs FIONBIO).
++  constexpr uint32_t kXFionbio = 0x8004667E;
++  constexpr uint32_t kXFionread = 0x4004667F;
++  if (cmd == kXFionbio || cmd == kXFionread) {
++    uint32_t be = 0;
++    std::memcpy(&be, arg_ptr, 4);
++    uint32_t value = __builtin_bswap32(be);
++#if REX_PLATFORM_WIN32
++    u_long native = value;
++    int ret = ioctlsocket(static_cast<SOCKET>(native_handle_), cmd == kXFionbio ? FIONBIO : FIONREAD, &native);
++#else
++    int native = static_cast<int>(value);
++    int ret = ioctl(static_cast<int>(native_handle_), cmd == kXFionbio ? FIONBIO : FIONREAD, &native);
++#endif
++    if (ret < 0) return X_STATUS_UNSUCCESSFUL;
++    if (cmd == kXFionread) {
++      uint32_t out = __builtin_bswap32(static_cast<uint32_t>(native));
++      std::memcpy(arg_ptr, &out, 4);
++    }
++    return X_STATUS_SUCCESS;
++  }
+   int ret = rex::net::socket_ioctl(native_handle_, cmd, arg_ptr);
+   if (ret < 0) {
+     // TODO: Get last error
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 77bce25..e0b1796 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -899,7 +899,11 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
+       thread_->set_affinity_mask(uint64_t(1) << cpu_index);
+     }
+   } else {
+-    REXSYS_WARN("Too few processor cores - scheduling will be wonky");
++    static bool warned = false;  // called on every affinity change; warn once
++    if (!warned) {
++      warned = true;
++      REXSYS_WARN("Too few processor cores - scheduling will be wonky");
++    }
+   }
+ }
+ 
+diff --git a/src/ui/keybinds.cpp b/src/ui/keybinds.cpp
+index 9822f3b..0fd656f 100644
+--- a/src/ui/keybinds.cpp
++++ b/src/ui/keybinds.cpp
+@@ -141,6 +141,10 @@ static const std::unordered_map<std::string, VirtualKey> kKeyNames = {
+     {"LMB", VirtualKey::kLButton},
+     {"RMB", VirtualKey::kRButton},
+     {"MMB", VirtualKey::kMButton},
++    {"Mouse4", VirtualKey::kXButton1},
++    {"Mouse5", VirtualKey::kXButton2},
++    {"MWheelUp", static_cast<VirtualKey>(0x0A)},    // pseudo-key (VK 0x0A is unassigned)
++    {"MWheelDown", static_cast<VirtualKey>(0x0B)},  // pseudo-key (VK 0x0B is unassigned)
+ };
+ 
+ VirtualKey ParseVirtualKey(std::string_view name) {
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index b94fe9e..37f633a 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -105,6 +105,13 @@ bool ReXApp::OnInitialize() {
+ bool ReXApp::SetupEnvironment() {
+   auto exe_dir = rex::filesystem::GetExecutableFolder();
+ 
++  // Load <exe_dir>/<name>.toml before resolving paths so a launcher-written config can
++  // supply game_data_root / update_data_root / user_data_root (CLI flags still win).
++  {
++    auto early_config = exe_dir / (std::string(GetName()) + ".toml");
++    if (std::filesystem::exists(early_config)) rex::cvar::LoadConfig(early_config);
++  }
++
+   std::filesystem::path game_dir;
+   std::string game_data_cvar = REXCVAR_GET(game_data_root);
+   if (!game_data_cvar.empty()) {
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index 2251429..ab7a42a 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -40,8 +40,29 @@
+ #include <rex/ui/surface_gnulinux.h>
+ #endif
+ 
++REXCVAR_DEFINE_BOOL(fullscreen_exclusive, false, "UI/Window",
++                    "Exclusive fullscreen (changes the display mode to the window size). Off = borderless");
++
+ namespace rex::ui {
+ 
++namespace {
++// Borderless desktop fullscreen uses a NULL mode; exclusive picks the closest real mode.
++void ApplyFullscreenMode(SDL_Window* w) {
++  if (!REXCVAR_GET(fullscreen_exclusive)) {
++    SDL_SetWindowFullscreenMode(w, nullptr);
++    return;
++  }
++  int ww = 0, wh = 0;
++  SDL_GetWindowSize(w, &ww, &wh);
++  SDL_DisplayMode mode;
++  if (SDL_GetClosestFullscreenDisplayMode(SDL_GetDisplayForWindow(w), ww, wh, 0.0f, true, &mode)) {
++    SDL_SetWindowFullscreenMode(w, &mode);
++  } else {
++    SDL_SetWindowFullscreenMode(w, nullptr);
++  }
++}
++}  // namespace
++
+ namespace {
+ 
+ uint32_t ResolveWindowWidth(uint32_t requested_width) {
+@@ -171,7 +192,7 @@ bool WindowSDL::OpenImpl() {
+   }
+ 
+   if (IsFullscreen()) {
+-    // Borderless desktop fullscreen (a NULL display mode is SDL3's default).
++    ApplyFullscreenMode(sdl_window_);
+     SDL_SetWindowFullscreen(sdl_window_, true);
+   }
+ #if REX_PLATFORM_MAC
+@@ -295,6 +316,7 @@ void WindowSDL::ApplyNewFullscreen() {
+   if (!sdl_window_) {
+     return;
+   }
++  if (IsFullscreen()) ApplyFullscreenMode(sdl_window_);
+   SDL_SetWindowFullscreen(sdl_window_, IsFullscreen());
+ }
+ 
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+index f102b56..684ce10 100644
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -285,7 +285,7 @@ set(SDL_OPENGLES OFF CACHE BOOL "" FORCE)
+ 
+ # Disable dummy drivers
+ set(SDL_DISKAUDIO OFF CACHE BOOL "" FORCE)
+-set(SDL_DUMMYAUDIO OFF CACHE BOOL "" FORCE)
++set(SDL_DUMMYAUDIO ON CACHE BOOL "" FORCE)
+ set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
+ 
+ # Linux video and audio backends. Both video drivers are always built so the

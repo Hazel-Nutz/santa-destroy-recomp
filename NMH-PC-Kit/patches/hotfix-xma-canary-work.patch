@@ -1,0 +1,63 @@
+diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
+index 11b83be..a851fab 100644
+--- a/src/audio/xma_context.cpp
++++ b/src/audio/xma_context.cpp
+@@ -117,6 +117,9 @@ bool XmaContext::Work() {
+     }
+     Consume(&output_rb, &data);
+     data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
++    if (output_rb.empty()) {
++      data.output_buffer_valid = 0;
++    }
+     StoreContextMerged(data, initial_data, context_ptr);
+     return true;
+   }
+@@ -132,18 +135,45 @@ bool XmaContext::Work() {
+     return true;
+   }
+ 
++  // [BO3, ported from Xenia Canary XmaContextNew::Work, Oct 2026]
+   while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
++    const uint32_t pre_decode_offset = data.input_buffer_read_offset;
++    const uint8_t pre_remaining_subframes = current_frame_remaining_subframes_;
++
+     Decode(&data);
+     Consume(&output_rb, &data);
+ 
+-    if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
++    // Don't abandon a partially consumed frame. Consume() hands over at most
++    // subframe_decode_count blocks per pass, so the pass that exhausts the input usually
++    // leaves the rest of the frame undelivered. Only XMAEnableContext re-enables the context,
++    // and a game polling for the remainder never kicks again -> it spins forever (BO3's
++    // "Sound Mix" thread at 100%, gun sounds never finish). Keep draining until it's out.
++    if ((!data.IsAnyInputBufferValid() || data.error_status == 4) &&
++        current_frame_remaining_subframes_ == 0) {
++      break;
++    }
++
++    // No progress (read offset unchanged, no new frame): stop instead of spinning.
++    if (pre_remaining_subframes == 0 && data.input_buffer_read_offset == pre_decode_offset &&
++        current_frame_remaining_subframes_ == 0) {
+       break;
+     }
+   }
+ 
+-  data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
++  if (initial_data.IsAnyInputBufferValid()) {
++    data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
++  } else {
++    // Starved on input: games use write_offset == read_offset as their stall detector.
++    if (data.output_buffer_write_offset != data.output_buffer_read_offset) {
++      data.output_buffer_write_offset = data.output_buffer_read_offset;
++      data.output_buffer_valid = 0;
++    }
++  }
+ 
+-  if (output_rb.empty()) {
++  // Only invalidate the output when the ring buffer is FULL (no free blocks and read==write).
++  // Invalidating whenever read==write also fired for an empty buffer, i.e. a voice that has
++  // not produced its first frame yet, which the game treats as finished (silent one-shots).
++  if (remaining_subframe_blocks_in_output_buffer_ == 0 && output_rb.empty()) {
+     data.output_buffer_valid = 0;
+   }
+ 

@@ -1,0 +1,97 @@
+diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
+index 4f4f5f9..4f5db26 100644
+--- a/src/audio/xma_context.cpp
++++ b/src/audio/xma_context.cpp
+@@ -37,6 +37,11 @@ REXCVAR_DEFINE_BOOL(xma_flush_tail, true, "Audio",
+                     "BO3: when a voice runs out of input, output the decoder's held-back last frame "
+                     "(otherwise every voice loses its final frame and 1-frame sounds are silent)");
+ 
++REXCVAR_DEFINE_BOOL(xma_reserve_block, true, "Audio",
++                    "BO3: never fill an XMA output ring completely. A full ring has write == read, "
++                    "which reads as EMPTY: short mono voices (6-block rings: gunshots, reloads) "
++                    "filled it in one pass and were heard as silence");
++
+ namespace {
+ // Per-context no-progress streaks; logged once per streak so the log stays small.
+ std::array<uint32_t, 512> g_no_progress{};
+@@ -119,25 +124,31 @@ void VoiceFinish(uint32_t id, const char* why) {
+   }
+ }
+ 
+-void VoiceTrackWork(uint32_t id, const rex::audio::XMA_CONTEXT_DATA& init, const rex::audio::XMA_CONTEXT_DATA& d,
+-                    const uint8_t* out_base, const uint8_t* ctx_raw) {
++void VoiceTrackBegin(uint32_t id, const rex::audio::XMA_CONTEXT_DATA& init, const uint8_t* ctx_raw) {
+   if (id >= g_voices.size()) return;
+   auto& v = g_voices[id];
+   const bool fresh = init.output_buffer_write_offset == 0 && init.output_buffer_read_offset == 0 &&
+                      init.current_buffer == 0 && init.input_buffer_read_offset == 32 &&
+                      init.input_buffer_0_valid;
+-  if (fresh || !v.active) {
+-    if (v.active) VoiceFinish(id, "restart");
+-    v = VoiceTrack{};
+-    v.active = true;
+-    v.stereo = init.is_stereo; v.rate = init.sample_rate; v.loop_n = init.loop_count;
+-    v.loop_s = init.loop_start; v.loop_e = init.loop_end; v.sdc = init.subframe_decode_count;
+-    v.out_blocks = init.output_buffer_block_count; v.in0_pk = init.input_buffer_0_packet_count;
+-    v.in1_pk = init.input_buffer_1_packet_count; v.in_ptr = init.input_buffer_0_ptr;
+-    v.in1_ptr = init.input_buffer_1_ptr;
+-    if (ctx_raw) std::memcpy(v.ctx_raw, ctx_raw, sizeof(v.ctx_raw));
+-    v.t0 = std::chrono::steady_clock::now();
+-  }
++  if (!fresh && v.active) return;
++  if (v.active) VoiceFinish(id, "restart");
++  v = VoiceTrack{};
++  v.active = true;
++  v.stereo = init.is_stereo; v.rate = init.sample_rate; v.loop_n = init.loop_count;
++  v.loop_s = init.loop_start; v.loop_e = init.loop_end; v.sdc = init.subframe_decode_count;
++  v.out_blocks = init.output_buffer_block_count; v.in0_pk = init.input_buffer_0_packet_count;
++  v.in1_pk = init.input_buffer_1_packet_count; v.in_ptr = init.input_buffer_0_ptr;
++  v.in1_ptr = init.input_buffer_1_ptr;
++  std::memcpy(v.ctx_raw, ctx_raw, sizeof(v.ctx_raw));
++  v.t0 = std::chrono::steady_clock::now();
++}
++
++void VoiceTrackWork(uint32_t id, const rex::audio::XMA_CONTEXT_DATA& init, const rex::audio::XMA_CONTEXT_DATA& d,
++                    const uint8_t* out_base, const uint8_t* ctx_raw) {
++  if (id >= g_voices.size()) return;
++  auto& v = g_voices[id];
++  (void)ctx_raw;
++  if (!v.active) return;
+   v.kicks++;
+   if (d.current_buffer != init.current_buffer) v.swaps++;
+   const uint32_t cap = init.output_buffer_block_count;
+@@ -289,7 +300,10 @@ bool XmaContext::Work() {
+   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
+   XMA_CONTEXT_DATA data(context_ptr);
+   const XMA_CONTEXT_DATA initial_data = data;
+-  if (REXCVAR_GET(xma_diag)) std::memcpy(g_voice_ctx_snapshot[id() & 511], context_ptr, 64);
++  if (REXCVAR_GET(xma_diag)) {
++    std::memcpy(g_voice_ctx_snapshot[id() & 511], context_ptr, 64);
++    VoiceTrackBegin(id(), initial_data, context_ptr);
++  }
+ 
+   if (!data.output_buffer_valid) {
+     return true;
+@@ -351,7 +365,11 @@ bool XmaContext::Work() {
+     }
+   }
+ 
+-  if (initial_data.IsAnyInputBufferValid()) {
++  const bool produced =
++      output_rb.write_offset() / kOutputBytesPerBlock != initial_data.output_buffer_write_offset;
++  if (initial_data.IsAnyInputBufferValid() || (produced && REXCVAR_GET(xma_reserve_block))) {
++    // (Also when input was already exhausted but this pass still delivered the rest of the last
++    // frame / the flushed tail: resetting write to read would throw that audio away.)
+     data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
+   } else {
+     // Starved on input: games use write_offset == read_offset as their stall detector.
+@@ -572,6 +590,9 @@ memory::RingBuffer XmaContext::PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data) {
+   output_rb.set_write_offset(output_write_offset);
+   remaining_subframe_blocks_in_output_buffer_ =
+       static_cast<int32_t>(output_rb.write_count()) / kOutputBytesPerBlock;
++  if (REXCVAR_GET(xma_reserve_block) && remaining_subframe_blocks_in_output_buffer_ > 0) {
++    remaining_subframe_blocks_in_output_buffer_ -= 1;  // keep write != read (see cvar)
++  }
+ 
+   return output_rb;
+ }

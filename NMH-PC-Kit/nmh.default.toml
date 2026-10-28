@@ -1,0 +1,58 @@
+# No More Heroes PC settings (edit freely; delete this file and re-run BUILD.bat to regenerate)
+gpu_plugin = "xenos"
+game_data_root = @GAME@
+update_data_root = @UPDATE@
+user_data_root = @USER@
+
+# Display
+fullscreen = true
+fullscreen_exclusive = false
+window_width = 1280
+window_height = 720
+vsync = false
+frame_rate_limit = 0          # 0 = off (frame-limiter SDK hotfix); check the game's own frame rate first
+resolution_scale = 1
+
+# GPU (Xenia-derived GPU backend settings)
+readback_memexport = false
+clear_memory_page_state = false
+gpu_allow_invalid_fetch_constants = true
+occlusion_query_enable = false
+
+# Keyboard + mouse mapped onto the Xbox 360 pad (Xbox controllers keep working).
+# Bindings are named after pad buttons; the game's own Controls screen shows what each does.
+# Values: key names (W, Space, Tab, 1..9, F1..) or LMB/RMB/MMB/MWheelUp/MWheelDown; several keys
+# per button: "E,L". Do NOT bind bare Shift/Control/Alt (modifiers never fire alone).
+mnk_mode = true
+mnk_mouse = true
+mnk_sensitivity = 2.0
+mnk_invert_y = false
+mnk_curve = 1.0
+mnk_smoothing = 0.0
+mnk_deadzone_comp = 0.18
+keybind_lstick_up = "W"
+keybind_lstick_down = "S"
+keybind_lstick_left = "A"
+keybind_lstick_right = "D"
+keybind_lstick_press = "Q"
+keybind_rstick_up = "Up"                 # camera (mouse also moves the right stick)
+keybind_rstick_down = "Down"
+keybind_rstick_left = "Left"
+keybind_rstick_right = "Right"
+keybind_rstick_press = "E"
+keybind_a = "Space,Return"
+keybind_b = "MMB,V"
+keybind_x = "LMB"
+keybind_y = "RMB"
+keybind_left_shoulder = "Z"
+keybind_right_shoulder = "X,MWheelDown"
+keybind_left_trigger = "Shift"
+keybind_right_trigger = "R,MWheelUp"
+keybind_dpad_up = "1"
+keybind_dpad_down = "2"
+keybind_dpad_left = "3"
+keybind_dpad_right = "4"
+keybind_start = "Escape"
+keybind_back = "Tab"
+
+monitor = 0

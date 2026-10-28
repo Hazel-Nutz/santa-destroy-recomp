@@ -1,0 +1,25 @@
+# No More Heroes: Heroes' Paradise / Eiyuutachi no Rakuen (Xbox 360 JP, default.xex, TitleID 4D5607D2,
+# MediaID 39F3F30C, base 0x82000000, entry 0x8261FA40) codegen overrides
+
+# XDK CRT setjmp/longjmp. setjmp 0x8298C090-0x8298C35C is a leaf without a .pdata entry: it checks a
+# hook pointer at 0x82AFF340 (lis r4,0x82B0 / lwz r0,-0xCC0(r4) / bnectr), then saves f14-f31,
+# r13-r31, v64-v127, LR, CR. longjmp 0x8298BD70 (.pdata 0x8298BD70-0x8298C084) restores them.
+setjmp_address = 0x8298C090
+longjmp_address = 0x8298BD70
+# CPU performance: keep PowerPC state in C++ locals instead of the shared context struct, so the
+# host compiler can register-allocate it (XenonRecomp uses the same set for Unleashed Recompiled).
+# non_volatile_as_local stays OFF: setjmp/longjmp restore r14-r31 through the context.
+skip_lr = true                 # calls don't store LR; returns are native C++ returns anyway
+ctr_as_local = true
+xer_as_local = true
+cr_as_local = true
+reserved_as_local = true
+# non_argument_as_local MUST stay off: the XDK register save/restore helpers take arguments in r11/r12
+# (addi r12,r1,-152 ; bl __savefpr_20), so a local r12 never reaches them -> FPRs written to address ~0,
+# memory corruption, black-screen hang at boot (2026-10-18).
+non_argument_as_local = false
+
+# Leaf helpers reached only via tail-branches (no .pdata entry): filled in from codegen output.
+[functions]
+0x82946178 = { end = 0x82946180 }   # this-adjust thunk (addi r3,r3,8 ; b 0x82944B90), tail-branched from 0x82946184
+0x82954748 = { end = 0x8295474C }   # thunk (b 0x82950DE8), tail-branched from 0x829512BC / 0x82954814
