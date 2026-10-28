@@ -1,0 +1,57 @@
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index e0b1796..d2345b0 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -172,6 +172,18 @@ void XThread::set_last_error(uint32_t error_code) {
+   guest_object<X_KTHREAD>()->last_error = error_code;
+ }
+ 
++// BO3: the game's "Sound Mix" thread mixes every 5.3 ms and decodes XMA inline (via the kick
++// register). On 4-core PCs it gets pre-empted by busy game threads, misses its deadline and XMA
++// voices (guns, announcer) drop or stutter. Run it at the same TIME_CRITICAL level as SDL's audio.
++static bool IsRealtimeAudioThread(const std::string& name) { return name.rfind("Sound Mix", 0) == 0; }
++static void ApplyRealtimePriority(rex::thread::Thread* t) {
++#if REX_PLATFORM_WIN32
++  t->set_priority(15);
++#else
++  t->set_priority(rex::thread::ThreadPriority::kHighest);
++#endif
++}
++
+ void XThread::set_name(const std::string_view name) {
+   std::lock_guard<std::mutex> lock(thread_lock_);
+   thread_name_ = fmt::format("{} ({:08X})", name, handle());
+@@ -180,6 +192,7 @@ void XThread::set_name(const std::string_view name) {
+     // May be getting set before the thread is created.
+     // One the thread is ready it will handle it.
+     thread_->set_name(thread_name_);
++    if (IsRealtimeAudioThread(thread_name_)) ApplyRealtimePriority(thread_.get());
+   }
+ }
+ 
+@@ -441,6 +454,7 @@ X_STATUS XThread::Create() {
+ 
+     // Set name immediately, if we have one.
+     thread_->set_name(thread_name_);
++    if (IsRealtimeAudioThread(thread_name_)) ApplyRealtimePriority(thread_.get());
+ 
+     PROFILE_THREAD_ENTER(thread_name_.c_str());
+     PROFILE_THREAD_CREATED();
+@@ -470,7 +484,7 @@ X_STATUS XThread::Create() {
+     set_name(fmt::format("XThread{:04X}", thread_->system_id()));
+   }
+ 
+-  if (creation_params_.creation_flags & 0x60) {
++  if ((creation_params_.creation_flags & 0x60) && !IsRealtimeAudioThread(thread_name_)) {
+     thread_->set_priority(creation_params_.creation_flags & 0x20 ? 1 : 0);
+   }
+ 
+@@ -853,7 +867,7 @@ void XThread::SetPriority(int32_t increment) {
+   } else {
+     target_priority = rex::thread::ThreadPriority::kNormal;
+   }
+-  if (!REXCVAR_GET(ignore_thread_priorities)) {
++  if (!REXCVAR_GET(ignore_thread_priorities) && !IsRealtimeAudioThread(thread_name_)) {
+     thread_->set_priority(target_priority);
+   }
+ }

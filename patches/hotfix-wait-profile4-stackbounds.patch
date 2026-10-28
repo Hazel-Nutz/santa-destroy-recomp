@@ -1,0 +1,22 @@
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+--- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp	2026-10-17 22:03:35.321788388 +0700
++++ b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp	2026-10-17 22:03:35.325468351 +0700
+@@ -88,9 +88,16 @@
+   out[0] = uint32_t(ctx->lr);
+   uint32_t frame = uint32_t(ctx->r1.u32);
+   auto* mem = REX_KERNEL_MEMORY();
+-  for (size_t i = 1; i < out.size() && frame >= 0x40000000u && frame < 0xF0000000u; ++i) {
++  // Stay strictly inside this thread's guest stack [stack_limit, stack_base): the outermost
++  // back chain points at stack_base, and the page above it is unmapped (reading it crashed).
++  if (!th->is_guest_thread() || !th->guest_object()) return out;
++  auto& kt = *mem->TranslateVirtual<X_KTHREAD*>(th->guest_object());
++  uint32_t lo = kt.stack_limit, hi = kt.stack_base;
++  if (!(lo < hi)) return out;
++  for (size_t i = 1; i < out.size(); ++i) {
++    if (frame < lo || frame + 4 > hi) break;
+     uint32_t back = rex::memory::load_and_swap<uint32_t>(mem->TranslateVirtual(frame));
+-    if (back <= frame || back - frame > 0x100000) break;
++    if (back <= frame || back < lo + 8 || back > hi) break;
+     out[i] = rex::memory::load_and_swap<uint32_t>(mem->TranslateVirtual(back - 8));
+     frame = back;
+   }

@@ -1,0 +1,63 @@
+# Functions reachable only via data pointers (vtables/callbacks) or lis/addi code refs
+# (find_vtable_funcs.py: 45 data-pointer leaves; code_refs.py + classify.py: 14 lis/addi code refs,
+# jump-table bases dropped). No .pdata entry and never called directly, so codegen cannot discover them.
+[functions]
+0x826A1C08 = { end = 0x826A1C18 }  # data ptr
+0x826A1CE8 = { end = 0x826A1D10 }  # data ptr
+0x826A1D10 = { end = 0x826A1D38 }  # data ptr
+0x826A1D38 = { end = 0x826A1D60 }  # data ptr
+0x826A1D60 = { end = 0x826A1D88 }  # data ptr
+0x826A2190 = { end = 0x826A21B0 }  # data ptr, end trimmed to next start
+0x826A21B0 = { end = 0x826A21C0 }  # lis/addi code ref
+0x826A21C0 = { end = 0x826A21D0 }  # lis/addi code ref
+0x826A21D0 = { end = 0x826A21E0 }  # lis/addi code ref
+0x826A21E0 = { end = 0x826A21F0 }  # lis/addi code ref
+0x826A21F0 = { end = 0x826A2200 }  # lis/addi code ref
+0x826A2200 = { end = 0x826A2210 }  # lis/addi code ref
+0x826A2210 = { end = 0x826A2220 }  # lis/addi code ref
+0x826A2220 = { end = 0x826A2230 }  # lis/addi code ref
+0x826A2230 = { end = 0x826A2240 }  # lis/addi code ref
+0x826A2240 = { end = 0x826A2250 }  # lis/addi code ref
+0x8272E448 = { end = 0x8272E458 }  # lis/addi code ref
+0x8272E458 = { end = 0x8272E4CC }  # lis/addi code ref
+0x82754770 = { end = 0x82754774 }  # lis/addi code ref
+0x8278A260 = { end = 0x8278A2D4 }  # lis/addi code ref
+0x8280F410 = { end = 0x8280F460 }  # data ptr
+0x8280F460 = { end = 0x8280F478 }  # data ptr
+0x828569F8 = { end = 0x82856A24 }  # data ptr
+0x82873E00 = { end = 0x82873E08 }  # data ptr
+0x82873E20 = { end = 0x82873E28 }  # data ptr
+0x82873E40 = { end = 0x82873E48 }  # data ptr
+0x82873FD8 = { end = 0x82873FF8 }  # data ptr
+0x82873FF8 = { end = 0x82874018 }  # data ptr
+0x82874018 = { end = 0x82874038 }  # data ptr
+0x82874038 = { end = 0x82874058 }  # data ptr
+0x82874058 = { end = 0x82874078 }  # data ptr
+0x82874078 = { end = 0x82874098 }  # data ptr
+0x82874098 = { end = 0x828740B8 }  # data ptr
+0x828740B8 = { end = 0x828740D8 }  # data ptr
+0x828740D8 = { end = 0x828740F8 }  # data ptr
+0x828740F8 = { end = 0x82874118 }  # data ptr
+0x8287B178 = { end = 0x8287B180 }  # data ptr
+0x8294B700 = { end = 0x8294B708 }  # data ptr
+0x8294B708 = { end = 0x8294B710 }  # data ptr
+0x8294B710 = { end = 0x8294B718 }  # data ptr
+0x8294B718 = { end = 0x8294B720 }  # data ptr
+0x8294B728 = { end = 0x8294B730 }  # data ptr
+0x8294B730 = { end = 0x8294B738 }  # data ptr
+0x82950450 = { end = 0x82950458 }  # data ptr
+0x82950458 = { end = 0x82950460 }  # data ptr
+0x82950468 = { end = 0x82950470 }  # data ptr
+0x82950470 = { end = 0x82950478 }  # data ptr
+0x82950478 = { end = 0x82950480 }  # data ptr
+0x82950700 = { end = 0x82950708 }  # data ptr
+0x82950708 = { end = 0x82950710 }  # data ptr
+0x82950710 = { end = 0x82950718 }  # data ptr
+0x82950720 = { end = 0x82950728 }  # data ptr
+0x82950728 = { end = 0x82950730 }  # data ptr
+0x82950730 = { end = 0x82950738 }  # data ptr
+0x82950DD8 = { end = 0x82950DE0 }  # data ptr
+0x82953B38 = { end = 0x82953B64 }  # data ptr
+0x82958A78 = { end = 0x82958A90 }  # data ptr
+0x82959930 = { end = 0x82959938 }  # data ptr
+0x829721E8 = { end = 0x829721F0 }  # data ptr

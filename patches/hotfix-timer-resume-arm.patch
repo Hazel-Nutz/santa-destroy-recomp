@@ -1,0 +1,29 @@
+diff --git a/src/system/xtimer.cpp b/src/system/xtimer.cpp
+--- a/src/system/xtimer.cpp	2026-10-17 22:58:06.393237253 +0700
++++ b/src/system/xtimer.cpp	2026-10-17 22:58:06.396054611 +0700
+@@ -41,10 +41,11 @@
+                           uint32_t routine_arg, bool resume) {
+   using rex::chrono::WinSystemClock;
+   using rex::chrono::XSystemClock;
+-  // Caller is checking for STATUS_TIMER_RESUME_IGNORED.
+-  if (resume) {
+-    return X_STATUS_TIMER_RESUME_IGNORED;
+-  }
++  // "Resume" (wake the system from sleep) isn't supported, but like NtSetTimerEx on Windows the
++  // timer must still be armed: the caller only gets STATUS_TIMER_RESUME_IGNORED as an
++  // informational status (checked by the XDK's SetWaitableTimer). Returning before arming left
++  // every fResume=TRUE timer dead: Onechanbara's 16.67 ms frame timers (job/loader threads) never
++  // fired, so loading advanced about once a second instead of once a frame.
+ 
+   period_ms = chrono::Clock::ScaleGuestDurationMillis(period_ms);
+   WinSystemClock::time_point due_tp;
+@@ -85,7 +86,8 @@
+         timer_->SetRepeatingAt(due_tp, std::chrono::milliseconds(period_ms), std::move(callback));
+   }
+ 
+-  return result ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;
++  if (!result) return X_STATUS_UNSUCCESSFUL;
++  return resume ? X_STATUS_TIMER_RESUME_IGNORED : X_STATUS_SUCCESS;
+ }
+ 
+ X_STATUS XTimer::Cancel() {

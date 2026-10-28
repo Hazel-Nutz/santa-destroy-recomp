@@ -1,0 +1,11 @@
+# Santa Destroy Recomp (Xbox 360 JP, TitleID 4D5607D2) - ReXGlue project manifest
+
+[project]
+name = "santadestroy"
+sdk_version = "0.10.0"
+game_root = "assets"
+
+[entrypoint]
+file_path = "assets/default.xex"
+out_directory_path = "generated/default"
+includes = ["config/codegen.toml", "config/vtable_funcs.toml"]

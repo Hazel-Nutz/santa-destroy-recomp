@@ -1,0 +1,22 @@
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+--- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp	2026-10-17 21:19:28.328581372 +0700
++++ b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp	2026-10-17 21:19:28.332794969 +0700
+@@ -49,6 +49,9 @@
+ #include <rex/thread/atomic.h>
+ #include <rex/thread/mutex.h>
+ 
++// Defined at global scope in system/runtime.cpp (hotfix-perf-report); declare it there too.
++REXCVAR_DECLARE(int32_t, perf_report_seconds);
++
+ namespace rex::kernel::xboxkrnl {
+ using namespace rex::system;
+ 
+@@ -59,8 +62,6 @@
+ REXCVAR_DEFINE_BOOL(wait_profile, false, "Kernel",
+                     "Log per-thread wait/delay/read time by guest caller every perf_report_seconds");
+ 
+-REXCVAR_DECLARE(int32_t, perf_report_seconds);
+-
+ namespace waitprof {
+ struct Stat {
+   uint64_t n = 0, us = 0, timeouts = 0, bytes = 0;
